@@ -368,29 +368,22 @@ def push_to_datastore(task_id, input, dry_run=False):
         except:
             raise util.JobError(e)
 
-    # Set the sample size for messytables
-    f.seek(0)
-    try:
-        col_count = len(unicode(f.readline(), 'utf-8').split(','))
-        if col_count > 50:
-            table_set.window = 2000
-        else:
-            table_set.window = 100000
-    except:
-        table_set.window = 100000
-
+    table_set.window = 2000
     row_set = table_set.tables.pop()
     offset, headers = messytables.headers_guess(row_set.sample)
+
+    existing = datastore_resource_exists(resource_id, api_key, ckan_url)
+    existing_info = None
+    if existing:
+        existing_info = dict((f['id'], f['info'])
+            for f in existing.get('fields', []) if 'info' in f)
 
     # Some headers might have been converted from strings to floats and such.
     headers = [unicode(header) for header in headers]
 
     row_set.register_processor(messytables.headers_processor(headers))
     row_set.register_processor(messytables.offset_processor(offset + 1))
-    if table_set.window == 2000:
-        types = messytables.type_guess(row_set.sample, types=[messytables.StringType], strict=True)
-    else:
-        types = messytables.type_guess(row_set.sample, types=TYPES, strict=True)
+    types = messytables.type_guess(row_set.sample, types=TYPES, strict=True)
 
     # These columns should always be string
     string_headers = ['zip','zipcode','postal','postalcode','ward','id','pid']
@@ -401,6 +394,15 @@ def push_to_datastore(task_id, input, dry_run=False):
             types[index] = 'String'
         elif header.lower().endswith('_id'):
             types[index] = 'String'
+
+    # override with types user requested
+    if existing_info:
+        types = [{
+            'text': messytables.StringType(),
+            'numeric': messytables.DecimalType(),
+            'timestamp': messytables.DateUtilType(),
+            }.get(existing_info.get(h, {}).get('type_override'), t)
+            for t, h in zip(types, headers)]
 
     row_set.register_processor(messytables.types_processor(types))
 
@@ -459,12 +461,14 @@ def push_to_datastore(task_id, input, dry_run=False):
                      for field in zip(headers, types)]
 
     # Maintain data dictionaries from matching column names
-    if existing:
-        existing_info = dict((f['id'], f['info'])
-            for f in existing.get('fields', []) if 'info' in f)
+    if existing_info:
         for h in headers_dicts:
             if h['id'] in existing_info:
                 h['info'] = existing_info[h['id']]
+                # create columns with types user requested
+                type_override = existing_info[h['id']].get('type_override')
+                if type_override in _TYPE_MAPPING.values():
+                    h['type'] = type_override
 
     logger.info('Determined headers and types: {headers}'.format(
         headers=headers_dicts))
