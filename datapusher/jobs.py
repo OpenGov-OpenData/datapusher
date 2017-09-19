@@ -15,6 +15,8 @@ import decimal
 import hashlib
 import cStringIO
 import time
+import subprocess
+import os
 
 import messytables
 from slugify import slugify
@@ -27,7 +29,7 @@ if not locale.getlocale()[0]:
     locale.setlocale(locale.LC_ALL, '')
 
 MAX_CONTENT_LENGTH = web.app.config.get('MAX_CONTENT_LENGTH') or 10485760
-DOWNLOAD_TIMEOUT = 30
+DOWNLOAD_TIMEOUT = 60
 
 _TYPE_MAPPING = {
     'String': 'text',
@@ -176,7 +178,8 @@ def delete_datastore_resource(resource_id, api_key, ckan_url):
                                  data=json.dumps({'id': resource_id,
                                                   'force': True}),
                                  headers={'Content-Type': 'application/json',
-                                          'Authorization': api_key}
+                                          'Authorization': api_key},
+                                 verify=False
                                  )
         check_response(response, delete_url, 'CKAN',
                        good_status=(201, 200, 404), ignore_no_success=True)
@@ -191,12 +194,13 @@ def datastore_resource_exists(resource_id, api_key, ckan_url):
                                  params={'id': resource_id,
                                          'limit': 0},
                                  headers={'Content-Type': 'application/json',
-                                          'Authorization': api_key}
+                                          'Authorization': api_key},
+                                 verify=False
                                  )
         if response.status_code == 404:
             return False
         elif response.status_code == 200:
-            return True
+            return response.json().get('result', {'fields': []})
         else:
             raise util.JobError('Error getting datastore resource.')
     except requests.exceptions.RequestException:
@@ -218,6 +222,7 @@ def send_resource_to_datastore(resource, headers, records, api_key, ckan_url):
                       data=json.dumps(request, cls=DatastoreEncoder),
                       headers={'Content-Type': 'application/json',
                                'Authorization': api_key},
+                      verify=False
                       )
     check_response(r, url, 'CKAN DataStore')
 
@@ -234,7 +239,9 @@ def update_resource(resource, api_key, ckan_url):
         url,
         data=json.dumps(resource),
         headers={'Content-Type': 'application/json',
-                 'Authorization': api_key})
+                 'Authorization': api_key},
+        verify=False
+        )
 
     check_response(r, url, 'CKAN')
 
@@ -247,7 +254,8 @@ def get_resource(resource_id, ckan_url, api_key):
     r = requests.post(url,
                       data=json.dumps({'id': resource_id}),
                       headers={'Content-Type': 'application/json',
-                               'Authorization': api_key}
+                               'Authorization': api_key},
+                      verify=False
                       )
     check_response(r, url, 'CKAN')
 
@@ -297,6 +305,7 @@ def push_to_datastore(task_id, input, dry_run=False):
     api_key = input.get('api_key')
 
     try:
+        time.sleep(5)
         resource = get_resource(resource_id, ckan_url, api_key)
     except util.JobError, e:
         #try again in 5 seconds just incase CKAN is slow at adding resource
@@ -359,6 +368,17 @@ def push_to_datastore(task_id, input, dry_run=False):
         except:
             raise util.JobError(e)
 
+    # Set the sample size for messytables
+    f.seek(0)
+    try:
+        col_count = len(unicode(f.readline(), 'utf-8').split(','))
+        if col_count > 50:
+            table_set.window = 2000
+        else:
+            table_set.window = 100000
+    except:
+        table_set.window = 100000
+
     row_set = table_set.tables.pop()
     offset, headers = messytables.headers_guess(row_set.sample)
 
@@ -367,7 +387,21 @@ def push_to_datastore(task_id, input, dry_run=False):
 
     row_set.register_processor(messytables.headers_processor(headers))
     row_set.register_processor(messytables.offset_processor(offset + 1))
-    types = messytables.type_guess(row_set.sample, types=TYPES, strict=True)
+    if table_set.window == 2000:
+        types = messytables.type_guess(row_set.sample, types=[messytables.StringType], strict=True)
+    else:
+        types = messytables.type_guess(row_set.sample, types=TYPES, strict=True)
+
+    # These columns should always be string
+    string_headers = ['zip','zipcode','postal','postalcode','ward','id','pid']
+    for index, header in enumerate(headers):
+        if header.lower().replace(' ','').replace('_','') in string_headers:
+            types[index] = 'String'
+        elif 'zipcode' in header.lower().replace(' ',''):
+            types[index] = 'String'
+        elif header.lower().endswith('_id'):
+            types[index] = 'String'
+
     row_set.register_processor(messytables.types_processor(types))
 
     headers = [header.strip() for header in headers if header.strip()]
@@ -384,18 +418,53 @@ def push_to_datastore(task_id, input, dry_run=False):
             yield data_row
     result = row_iterator()
 
+    # Generate other export format
+    res_format = resource.get('format','')
+    if res_format.lower() == 'csv' and resource.get('url','').startswith(ckan_url):
+        res_source = '/data/ckan/resources/'+resource_id[0:3]+'/'+resource_id[3:6]+'/'+resource_id[6:]
+
+        export_dir = '/data/ckan/storage/export/'+resource_id[0:3]+'/'+resource_id[3:6]+'/'
+        json_out = export_dir + resource_id + '.json'
+        tsv_out = export_dir + resource_id + '.tsv'
+
+        base_url = ckan_url+'export/'+resource_id[0:3]+'/'+resource_id[3:6]+'/'
+        json_url = base_url+resource_id+'.json'
+        tsv_url = base_url+resource_id+'.tsv'
+
+        try:
+            os.makedirs(export_dir)
+        except:
+            pass
+
+        logger.info('JSON export: {json_url}'.format(json_url=json_url))
+        json_params = ["/home/ubuntu/ckan_export_scripts/json_export", res_source, json_out]
+        json_process = subprocess.Popen(json_params, stdout=None, stderr=None)
+
+        logger.info('TSV export: {tsv_url}'.format(tsv_url=tsv_url))
+        tsv_params = ["/home/ubuntu/ckan_export_scripts/tsv_export", res_source, tsv_out]
+        tsv_process = subprocess.Popen(tsv_params, stdout=None, stderr=None)
+
     '''
     Delete existing datstore resource before proceeding. Otherwise
     'datastore_create' will append to the existing datastore. And if
     the fields have significantly changed, it may also fail.
     '''
-    if datastore_resource_exists(resource_id, api_key, ckan_url):
+    existing = datastore_resource_exists(resource_id, api_key, ckan_url)
+    if existing:
         logger.info('Deleting "{res_id}" from datastore.'.format(
             res_id=resource_id))
         delete_datastore_resource(resource_id, api_key, ckan_url)
 
     headers_dicts = [dict(id=field[0], type=TYPE_MAPPING[str(field[1])])
                      for field in zip(headers, types)]
+
+    # Maintain data dictionaries from matching column names
+    if existing:
+        existing_info = dict((f['id'], f['info'])
+            for f in existing.get('fields', []) if 'info' in f)
+        for h in headers_dicts:
+            if h['id'] in existing_info:
+                h['info'] = existing_info[h['id']]
 
     logger.info('Determined headers and types: {headers}'.format(
         headers=headers_dicts))
@@ -412,6 +481,17 @@ def push_to_datastore(task_id, input, dry_run=False):
 
     logger.info('Successfully pushed {n} entries to "{res_id}".'.format(
         n=count, res_id=resource_id))
+
+    # Purge cache
+    purge_params = ['/home/ubuntu/nginx-cache-purge/nginx-cache-purge', resource_id, '/tmp/datastoredump_cache/']
+    purge_process = subprocess.Popen(purge_params, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    purge_result = purge_process.stdout.read()
+    logger.info('Purge DataStore dump/odata cache: {purge_result}'.format(purge_result=purge_result))
+
+    purge_params_2 = ['/home/ubuntu/nginx-cache-purge/nginx-cache-purge', resource_id, '/tmp/datastoresearchsql_cache/']
+    purge_process_2 = subprocess.Popen(purge_params_2, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    purge_result_2 = purge_process_2.stdout.read()
+    logger.info('Purge DataStore search sql cache: {purge_result}'.format(purge_result=purge_result_2))
 
     if data.get('set_url_type', False):
         update_resource(resource, api_key, ckan_url)
