@@ -487,10 +487,10 @@ def push_to_datastore(task_id, input, dry_run=False):
         n=count, res_id=resource_id))
 
     # Purge cache
-    purge_params = ['/home/ubuntu/nginx-cache-purge/nginx-cache-purge', resource_id, '/tmp/datastoredump_cache/']
+    purge_params = ['/home/ubuntu/nginx-cache-purge/nginx-cache-purge', resource_id, '/tmp/odata_cache/']
     purge_process = subprocess.Popen(purge_params, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     purge_result = purge_process.stdout.read()
-    logger.info('Purge DataStore dump/odata cache: {purge_result}'.format(purge_result=purge_result))
+    logger.info('Purge odata cache: {purge_result}'.format(purge_result=purge_result))
 
     purge_params_2 = ['/home/ubuntu/nginx-cache-purge/nginx-cache-purge', resource_id, '/tmp/datastoresearchsql_cache/']
     purge_process_2 = subprocess.Popen(purge_params_2, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
